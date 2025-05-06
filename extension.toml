@@ -1,0 +1,11 @@
+id = "crates-io"
+name = "Crates.io Version Checker"
+version = "0.0.1"
+schema_version = 1
+authors = ["Lars Wrenger <lars@wrenger.net>"]
+description = "Check for new versions of crates.io packages in your Cargo.toml file"
+repository = "https://github.com/wrenger/zed-crates-io"
+
+[language_servers.crates-io]
+name = "Rust Cargo Manifest"
+languages = ["TOML"]
