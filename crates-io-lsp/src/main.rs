@@ -66,9 +66,7 @@ fn main() -> Result<()> {
 
         for msg in &connection.receiver {
             match msg {
-                Message::Request(req) => match req.method.as_str() {
-                    _ => error!("Unsupported request: {}", req.method),
-                },
+                Message::Request(req) => error!("Unsupported request: {}", req.method),
                 Message::Response(resp) => {
                     info!("Received response: {resp:?}");
                 }
@@ -109,7 +107,7 @@ fn handle_notification(
             );
 
             update_diagnostics(
-                &connection,
+                connection,
                 &params.text_document.uri,
                 Some(params.text_document.version),
                 &params.text_document.text,
@@ -159,10 +157,10 @@ fn handle_notification(
                 return Ok(());
             };
             update_diagnostics(
-                &connection,
+                connection,
                 &params.text_document.uri,
                 version,
-                &text,
+                text,
                 version_db,
             );
         }
@@ -178,7 +176,7 @@ fn handle_notification(
             }
 
             // Clear diagnostics for the closed document
-            publish_diagnostics(&connection, &params.text_document.uri, None, Vec::new());
+            publish_diagnostics(connection, &params.text_document.uri, None, Vec::new());
             open_docs.remove(&params.text_document.uri);
         }
         _ => warn!("Unhandled notification: {notif:?}"),
@@ -189,7 +187,7 @@ fn handle_notification(
 fn is_cargo_toml(uri: &Uri) -> bool {
     uri.path()
         .segments()
-        .last()
+        .next_back()
         .is_some_and(|n| n == "Cargo.toml")
 }
 
@@ -273,7 +271,7 @@ fn collect_diagnostics(
     text: &str,
     version_db: &mut api::VersionDB,
 ) -> Result<Vec<lsp_types::Diagnostic>> {
-    let parsed: SpannedManifest = toml::from_str(&text)?;
+    let parsed: SpannedManifest = toml::from_str(text)?;
     let deps = parsed
         .dependencies
         .iter()
@@ -295,8 +293,8 @@ fn collect_diagnostics(
         let (name, info) = deps.iter().find(|(n, _)| n.as_ref() == &name).unwrap();
 
         let range = if let (Some(start), Some(end)) = (
-            offset_to_pos(&text, name.span().start),
-            offset_to_pos(&text, name.span().end),
+            offset_to_pos(text, name.span().start),
+            offset_to_pos(text, name.span().end),
         ) {
             lsp_types::Range { start, end }
         } else {

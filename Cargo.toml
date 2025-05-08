@@ -10,4 +10,4 @@ members = ["crates-io-lsp"]
 crate-type = ["cdylib"]
 
 [dependencies]
-zed_extension_api = "0.5.0"
+zed_extension_api = "0.4.0"

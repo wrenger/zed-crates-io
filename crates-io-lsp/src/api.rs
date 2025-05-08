@@ -31,11 +31,10 @@ impl<'a> VersionDB<'a> {
         }
     }
 
-    pub fn get_versions(&mut self, names: Vec<impl Into<String>>) -> Vec<(String, Vec<String>)> {
+    pub fn get_versions(&mut self, names: Vec<String>) -> Vec<(String, Vec<String>)> {
         let mut results = Vec::new();
         let mut count = 0;
         for name in names {
-            let name: String = name.into();
             if let Some(versions) = self.cache.get(&name) {
                 results.push((name, versions.clone()));
             } else {
