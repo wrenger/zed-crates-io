@@ -33,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build
-        run: cargo build -crates-io-lsp -r
+        run: cargo build -p crates-io-lsp -r
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -41,12 +41,12 @@ jobs:
           path: target/release/${{ matrix.exe }}
       - name: Package
         run:  |
-          cp target/release/${{ matrix.exe }} .
+          cd target/release
           zip crates-io-lsp-${{ matrix.target }}.zip ${{ matrix.exe }}
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         if: github.ref_type == 'tag'
         with:
-          files: crates-io-lsp-${{ matrix.target }}.zip
+          files: target/release/crates-io-lsp-${{ matrix.target }}.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
