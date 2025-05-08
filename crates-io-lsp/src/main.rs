@@ -1,22 +1,17 @@
 use std::collections::{BTreeMap, HashMap};
-use std::thread;
 
 use anyhow::Result;
 use cargo_manifest::Dependency;
 use clap::Parser;
-use lsp_server::{Connection, Message, Notification};
-use lsp_types::notification::{
-    DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
-    Notification as _, PublishDiagnostics,
-};
-use lsp_types::{
-    DiagnosticServerCapabilities, DiagnosticSeverity, DidChangeTextDocumentParams,
+use tokio::sync::RwLock;
+use toml::Spanned;
+use tower_lsp_server::lsp_types::{
+    self, DiagnosticServerCapabilities, DiagnosticSeverity, DidChangeTextDocumentParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    InitializeParams, Position, PublishDiagnosticsParams, ServerCapabilities,
+    InitializeParams, InitializeResult, MessageType, Position, ServerCapabilities,
     TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
-use toml::Spanned;
-use tracing::{error, info, warn, Level};
+use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
 
 mod api;
 
@@ -24,164 +19,293 @@ mod api;
 struct Args {
     #[arg(short, long, default_value = "https://index.crates.io")]
     endpoint: String,
-    #[arg(short, long)]
-    token: Option<String>,
+    #[arg(short, long, default_value = "")]
+    token: String,
 }
 
-fn main() -> Result<()> {
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .without_time()
-        .with_file(true)
-        .with_line_number(true)
-        .with_target(false)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).unwrap();
+struct CratesIoBackend {
+    client: Client,
+    endpoint: String,
+    token: String,
+    open_docs: RwLock<HashMap<Uri, FileInfo>>,
+    cache: RwLock<HashMap<String, Vec<String>>>,
+}
 
-    info!(
-        "Starting LSP {:?}",
-        std::env::args().skip(1).collect::<Vec<_>>()
-    );
+impl LanguageServer for CratesIoBackend {
+    async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("Init {:?}", params.initialization_options),
+            )
+            .await;
+        Ok(InitializeResult {
+            capabilities: ServerCapabilities {
+                text_document_sync: Some(TextDocumentSyncCapability::Kind(
+                    TextDocumentSyncKind::FULL,
+                )),
+                diagnostic_provider: Some(
+                    DiagnosticServerCapabilities::Options(Default::default()),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "DidOpen: {} {}",
+                    params.text_document.version,
+                    params.text_document.uri.as_str()
+                ),
+            )
+            .await;
+        if !is_cargo_toml(&params.text_document.uri) {
+            return;
+        }
+
+        self.open_docs.write().await.insert(
+            params.text_document.uri.clone(),
+            FileInfo::new(
+                params.text_document.text.clone(),
+                params.text_document.version,
+            ),
+        );
+
+        self.update_diagnostics(
+            &params.text_document.uri,
+            Some(params.text_document.version),
+            &params.text_document.text,
+        )
+        .await;
+    }
+
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "DidChange: {} {}",
+                    params.text_document.version,
+                    params.text_document.uri.as_str()
+                ),
+            )
+            .await;
+        if !is_cargo_toml(&params.text_document.uri) {
+            return;
+        }
+
+        let mut open_docs = self.open_docs.write().await;
+        let doc = open_docs.get_mut(&params.text_document.uri).unwrap();
+        for change in params.content_changes {
+            if let Some(range) = change.range {
+                let start = pos_to_offset(&doc.text, range.start).unwrap();
+                let end = pos_to_offset(&doc.text, range.end).unwrap();
+                doc.text.replace_range(start..end, &change.text);
+            } else {
+                doc.text = change.text;
+            }
+        }
+        doc.version = params.text_document.version;
+    }
+
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("DidSave: {}", params.text_document.uri.as_str()),
+            )
+            .await;
+        if !is_cargo_toml(&params.text_document.uri) {
+            return;
+        }
+
+        let mut open_docs = self.open_docs.write().await;
+        let doc = open_docs.get_mut(&params.text_document.uri);
+        let (text, version) = if let (Some(doc), Some(text)) = (doc, &params.text) {
+            doc.text = text.clone();
+            (&doc.text, Some(doc.version))
+        } else if let Some(text) = &params.text {
+            (text, None)
+        } else {
+            return;
+        };
+        self.update_diagnostics(&params.text_document.uri, version, text)
+            .await;
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("DidClose: {}", params.text_document.uri.as_str()),
+            )
+            .await;
+        if !is_cargo_toml(&params.text_document.uri) {
+            return;
+        }
+
+        // Clear diagnostics for the closed document
+        self.client
+            .publish_diagnostics(params.text_document.uri.clone(), Vec::new(), None)
+            .await;
+
+        let mut open_docs = self.open_docs.write().await;
+        open_docs.remove(&params.text_document.uri);
+    }
+
+    async fn shutdown(&self) -> jsonrpc::Result<()> {
+        self.client.log_message(MessageType::INFO, "Shutdown").await;
+        Ok(())
+    }
+}
+
+impl CratesIoBackend {
+    async fn update_diagnostics(&self, uri: &Uri, version: Option<i32>, text: &str) {
+        match self.collect_diagnostics(text).await {
+            Ok(diagnostics) => {
+                self.client
+                    .publish_diagnostics(uri.clone(), diagnostics, version)
+                    .await
+            }
+            Err(err) => {
+                self.client
+                    .log_message(MessageType::ERROR, format!("Failed diagnostics: {err}"))
+                    .await
+            }
+        }
+    }
+
+    async fn collect_diagnostics(&self, text: &str) -> Result<Vec<lsp_types::Diagnostic>> {
+        let parsed: SpannedManifest = toml::from_str(text)?;
+        let deps = parsed
+            .dependencies
+            .iter()
+            .chain(parsed.build_dependencies.iter())
+            .chain(parsed.dev_dependencies.iter())
+            .collect::<Vec<_>>();
+
+        let dep_names = deps
+            .iter()
+            .map(|(name, _)| name.as_ref().to_string())
+            .collect::<Vec<_>>();
+        // Fetch versions for dependencies (in parallel)
+        let dep_versions = self.get_versions(dep_names).await;
+
+        let mut diagnostics = Vec::new();
+        for (name, mut versions) in dep_versions {
+            versions.reverse();
+
+            let (name, info) = deps.iter().find(|(n, _)| n.as_ref() == &name).unwrap();
+
+            let range = if let (Some(start), Some(end)) = (
+                offset_to_pos(text, name.span().start),
+                offset_to_pos(text, name.span().end),
+            ) {
+                lsp_types::Range { start, end }
+            } else {
+                continue; // Outside the document?
+            };
+
+            let (message, severity) = if !versions.is_empty() {
+                let (prefix, severity) = if info.req() == "*" {
+                    ("Matches any Version", DiagnosticSeverity::INFORMATION)
+                } else if let Some(pos) = versions.iter().position(|v| v.starts_with(info.req())) {
+                    if pos == 0 {
+                        ("Latest Version", DiagnosticSeverity::HINT)
+                    } else {
+                        ("Outdated Version", DiagnosticSeverity::WARNING)
+                    }
+                } else {
+                    ("Unknown Version", DiagnosticSeverity::ERROR)
+                };
+                let message = format!(
+                    "{prefix}\n\n{} ({})\n{}",
+                    name.as_ref(),
+                    info.req(),
+                    versions.join("\n")
+                );
+
+                (message, severity)
+            } else {
+                (
+                    format!("Failed to fetch versions for {}", name.as_ref()),
+                    DiagnosticSeverity::ERROR,
+                )
+            };
+
+            diagnostics.push(lsp_types::Diagnostic {
+                range,
+                severity: Some(severity),
+                source: Some("crates-io".into()),
+                message,
+                ..Default::default()
+            });
+        }
+
+        Ok(diagnostics)
+    }
+
+    pub async fn get_versions(&self, names: Vec<String>) -> Vec<(String, Vec<String>)> {
+        let mut set = tokio::task::JoinSet::new();
+        let mut results = Vec::new();
+        {
+            // Read access
+            let cache = self.cache.read().await;
+            for name in names {
+                if let Some(versions) = cache.get(&name) {
+                    results.push((name, versions.clone()));
+                } else {
+                    let endpoint = self.endpoint.clone();
+                    let token = self.token.clone();
+                    set.spawn(async move {
+                        let versions = api::fetch_versions(&name, &endpoint, &token).await;
+                        (name, versions)
+                    });
+                }
+            }
+        }
+        let joined = set.join_all().await;
+        if !joined.is_empty() {
+            // Lock only if necessary
+            let mut cache = self.cache.write().await;
+            for (name, versions) in joined {
+                match versions {
+                    Ok(versions) => {
+                        cache.insert(name.clone(), versions.clone());
+                        results.push((name, versions));
+                    }
+                    Err(e) => {
+                        self.client
+                            .log_message(MessageType::ERROR, format!("Failed fetching {name}: {e}"))
+                            .await
+                    }
+                }
+            }
+        }
+        results
+    }
+}
+
+#[tokio::main]
+async fn main() {
     let args = Args::parse();
 
-    let (connection, _io_threads) = Connection::stdio();
+    let (service, socket) = LspService::new(|client| CratesIoBackend {
+        client,
+        endpoint: args.endpoint,
+        token: args.token,
+        cache: Default::default(),
+        open_docs: Default::default(),
+    });
 
-    let capabilities = ServerCapabilities {
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
-        diagnostic_provider: Some(DiagnosticServerCapabilities::Options(Default::default())),
-        ..Default::default()
-    };
-    let capabilities = serde_json::to_value(capabilities).unwrap();
-    let init_params = connection.initialize(capabilities)?;
-    let params: InitializeParams = serde_json::from_value(init_params)?;
-
-    info!("Connected to {:?}", params.client_info);
-
-    let mut open_docs = HashMap::new();
-
-    thread::scope(|scope| {
-        let mut version_db = api::VersionDB::new(scope, &args.endpoint, args.token.as_deref());
-
-        for msg in &connection.receiver {
-            match msg {
-                Message::Request(req) => error!("Unsupported request: {}", req.method),
-                Message::Response(resp) => {
-                    info!("Received response: {resp:?}");
-                }
-                Message::Notification(notif) => {
-                    handle_notification(notif, &connection, &mut open_docs, &mut version_db)?
-                }
-            }
-        }
-        Ok(())
-    })
-}
-
-fn handle_notification(
-    notif: Notification,
-    connection: &Connection,
-    open_docs: &mut HashMap<Uri, FileInfo>,
-    version_db: &mut api::VersionDB,
-) -> Result<()> {
-    match notif.method.as_str() {
-        DidOpenTextDocument::METHOD => {
-            let params: DidOpenTextDocumentParams = notif.extract(DidOpenTextDocument::METHOD)?;
-            info!(
-                "DidOpenTextDocument: {} {}",
-                params.text_document.version,
-                params.text_document.uri.as_str()
-            );
-            if !is_cargo_toml(&params.text_document.uri) {
-                info!("Skipping {}", params.text_document.uri.as_str());
-                return Ok(());
-            }
-
-            open_docs.insert(
-                params.text_document.uri.clone(),
-                FileInfo::new(
-                    params.text_document.text.clone(),
-                    params.text_document.version,
-                ),
-            );
-
-            update_diagnostics(
-                connection,
-                &params.text_document.uri,
-                Some(params.text_document.version),
-                &params.text_document.text,
-                version_db,
-            );
-        }
-        DidChangeTextDocument::METHOD => {
-            let params: DidChangeTextDocumentParams =
-                notif.extract(DidChangeTextDocument::METHOD)?;
-            info!(
-                "DidChangeTextDocument: {} {}",
-                params.text_document.version,
-                params.text_document.uri.as_str()
-            );
-            if !is_cargo_toml(&params.text_document.uri) {
-                info!("Skipping {}", params.text_document.uri.as_str());
-                return Ok(());
-            }
-
-            let doc = open_docs.get_mut(&params.text_document.uri).unwrap();
-            for change in params.content_changes {
-                if let Some(range) = change.range {
-                    let start = pos_to_offset(&doc.text, range.start).unwrap();
-                    let end = pos_to_offset(&doc.text, range.end).unwrap();
-                    doc.text.replace_range(start..end, &change.text);
-                } else {
-                    doc.text = change.text;
-                }
-            }
-            doc.version = params.text_document.version;
-        }
-        DidSaveTextDocument::METHOD => {
-            let params: DidSaveTextDocumentParams = notif.extract(DidSaveTextDocument::METHOD)?;
-            info!("DidSaveTextDocument: {}", params.text_document.uri.as_str());
-            if !is_cargo_toml(&params.text_document.uri) {
-                info!("Skipping {}", params.text_document.uri.as_str());
-                return Ok(());
-            }
-
-            let doc = open_docs.get_mut(&params.text_document.uri);
-            let (text, version) = if let (Some(doc), Some(text)) = (doc, &params.text) {
-                doc.text = text.clone();
-                (&doc.text, Some(doc.version))
-            } else if let Some(text) = &params.text {
-                (text, None)
-            } else {
-                return Ok(());
-            };
-            update_diagnostics(
-                connection,
-                &params.text_document.uri,
-                version,
-                text,
-                version_db,
-            );
-        }
-        DidCloseTextDocument::METHOD => {
-            let params: DidCloseTextDocumentParams = notif.extract(DidCloseTextDocument::METHOD)?;
-            info!(
-                "DidCloseTextDocument: {}",
-                params.text_document.uri.as_str()
-            );
-            if !is_cargo_toml(&params.text_document.uri) {
-                info!("Skipping {}", params.text_document.uri.as_str());
-                return Ok(());
-            }
-
-            // Clear diagnostics for the closed document
-            publish_diagnostics(connection, &params.text_document.uri, None, Vec::new());
-            open_docs.remove(&params.text_document.uri);
-        }
-        _ => warn!("Unhandled notification: {notif:?}"),
-    }
-    Ok(())
+    Server::new(tokio::io::stdin(), tokio::io::stdout(), socket)
+        .serve(service)
+        .await;
 }
 
 fn is_cargo_toml(uri: &Uri) -> bool {
@@ -234,107 +358,4 @@ struct SpannedManifest {
     dependencies: BTreeMap<Spanned<String>, Dependency>,
     build_dependencies: BTreeMap<Spanned<String>, Dependency>,
     dev_dependencies: BTreeMap<Spanned<String>, Dependency>,
-}
-
-fn update_diagnostics(
-    connection: &Connection,
-    uri: &Uri,
-    version: Option<i32>,
-    text: &str,
-    version_db: &mut api::VersionDB,
-) {
-    match collect_diagnostics(text, version_db) {
-        Ok(diagnostics) => publish_diagnostics(connection, uri, version, diagnostics),
-        Err(err) => error!("Failed diagnostics: {err}"),
-    }
-}
-
-fn publish_diagnostics(
-    connection: &Connection,
-    uri: &Uri,
-    version: Option<i32>,
-    diagnostics: Vec<lsp_types::Diagnostic>,
-) {
-    connection
-        .sender
-        .send(Message::Notification(Notification::new(
-            PublishDiagnostics::METHOD.into(),
-            PublishDiagnosticsParams {
-                uri: uri.clone(),
-                diagnostics,
-                version,
-            },
-        )))
-        .unwrap();
-}
-fn collect_diagnostics(
-    text: &str,
-    version_db: &mut api::VersionDB,
-) -> Result<Vec<lsp_types::Diagnostic>> {
-    let parsed: SpannedManifest = toml::from_str(text)?;
-    let deps = parsed
-        .dependencies
-        .iter()
-        .chain(parsed.build_dependencies.iter())
-        .chain(parsed.dev_dependencies.iter())
-        .collect::<Vec<_>>();
-
-    let dep_names = deps
-        .iter()
-        .map(|(name, _)| name.as_ref().to_string())
-        .collect::<Vec<_>>();
-    // Fetch versions for dependencies (in parallel)
-    let dep_versions = version_db.get_versions(dep_names);
-
-    let mut diagnostics = Vec::new();
-    for (name, mut versions) in dep_versions {
-        versions.reverse();
-
-        let (name, info) = deps.iter().find(|(n, _)| n.as_ref() == &name).unwrap();
-
-        let range = if let (Some(start), Some(end)) = (
-            offset_to_pos(text, name.span().start),
-            offset_to_pos(text, name.span().end),
-        ) {
-            lsp_types::Range { start, end }
-        } else {
-            continue; // Outside the document?
-        };
-
-        let (message, severity) = if !versions.is_empty() {
-            let (prefix, severity) =
-                if let Some(pos) = versions.iter().position(|v| v.starts_with(info.req())) {
-                    if pos == 0 {
-                        ("Latest Version", DiagnosticSeverity::INFORMATION)
-                    } else {
-                        ("Outdated Version", DiagnosticSeverity::WARNING)
-                    }
-                } else {
-                    ("Unknown Version", DiagnosticSeverity::ERROR)
-                };
-            let message = format!(
-                "{prefix}\n\n{} ({})\n{}",
-                name.as_ref(),
-                info.req(),
-                versions.join("\n")
-            );
-
-            (message, severity)
-        } else {
-            (
-                format!("Failed to fetch versions for {}", name.as_ref()),
-                DiagnosticSeverity::ERROR,
-            )
-        };
-
-        diagnostics.push(lsp_types::Diagnostic {
-            range,
-            severity: Some(severity),
-            source: Some("crates-io".to_string()),
-            message,
-            ..Default::default()
-        });
-    }
-
-    Ok(diagnostics)
 }
