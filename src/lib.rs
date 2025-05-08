@@ -104,6 +104,9 @@ impl zed::Extension for CratesIoExtension {
             )
             .map_err(|e| format!("failed to download file: {e}"))?;
 
+            zed::make_file_executable(&binary_path)
+                .map_err(|e| format!("failed to make lsp executable {e}"))?;
+
             // Cleanup old versions
             let entries =
                 fs::read_dir(".").map_err(|e| format!("failed to list working directory {e}"))?;
