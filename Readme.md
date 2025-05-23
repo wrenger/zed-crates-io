@@ -1,8 +1,9 @@
 # Crates.io LSP Server
 
-Fetches information about outdated dependencies for Cargo.toml files.
+Fetches information about outdated dependencies for `Cargo.toml` files.
 
-WARNING: This extension is currently in development and may not work as expected.
+> [!WARNING]
+> This extension is currently in development and may not work as expected.
 
 
 ## Manual Installation
@@ -36,3 +37,7 @@ And then add the following Zed configuration:
   }
 }
 ```
+
+Possible arguments are:
+- `--endpoint`: The endpoint to the language server. Default is `https://index.crates.io`
+- `--token`: Optional token for the API endpoint.

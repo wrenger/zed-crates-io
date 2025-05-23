@@ -187,6 +187,8 @@ impl CratesIoBackend {
             .iter()
             .chain(parsed.build_dependencies.iter())
             .chain(parsed.dev_dependencies.iter())
+            // Filter out relative dependencies
+            .filter(|d| !d.1.detail().is_some_and(|d| d.path.is_some()))
             .collect::<Vec<_>>();
 
         let dep_names = deps
@@ -232,6 +234,16 @@ impl CratesIoBackend {
 
                 (message, severity)
             } else {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!(
+                            "Failed to fetch versions for {}:\n{:?}",
+                            name.as_ref(),
+                            info
+                        ),
+                    )
+                    .await;
                 (
                     format!("Failed to fetch versions for {}", name.as_ref()),
                     DiagnosticSeverity::ERROR,
