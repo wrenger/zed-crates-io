@@ -5,11 +5,12 @@ use cargo_manifest::Dependency;
 use clap::Parser;
 use tokio::sync::RwLock;
 use toml::Spanned;
-use tower_lsp_server::lsp_types::{
+use tower_lsp_server::ls_types::{
     self, DiagnosticServerCapabilities, DiagnosticSeverity, DidChangeTextDocumentParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    InitializeParams, InitializeResult, MessageType, Position, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    DocumentDiagnosticParams, DocumentDiagnosticReportResult, InitializeParams, InitializeResult,
+    MessageType, Position, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
+    Uri,
 };
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
 
@@ -75,13 +76,6 @@ impl LanguageServer for CratesIoBackend {
                 params.text_document.version,
             ),
         );
-
-        self.update_diagnostics(
-            &params.text_document.uri,
-            Some(params.text_document.version),
-            &params.text_document.text,
-        )
-        .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -158,6 +152,50 @@ impl LanguageServer for CratesIoBackend {
         open_docs.remove(&params.text_document.uri);
     }
 
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> jsonrpc::Result<DocumentDiagnosticReportResult> {
+        let uri = params.text_document.uri;
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("Diagnostic request: {}", uri.as_str()),
+            )
+            .await;
+        let doc = self.open_docs.read().await.get(&uri).cloned();
+        let Some(text) = doc.map(|d| d.text) else {
+            return Err(jsonrpc::Error {
+                code: jsonrpc::ErrorCode::InvalidParams,
+                message: "Document not found".into(),
+                data: None,
+            });
+        };
+        match self.collect_diagnostics(&text).await {
+            Ok(diagnostics) => Ok(DocumentDiagnosticReportResult::Report(
+                ls_types::DocumentDiagnosticReport::Full(
+                    ls_types::RelatedFullDocumentDiagnosticReport {
+                        related_documents: None,
+                        full_document_diagnostic_report: ls_types::FullDocumentDiagnosticReport {
+                            result_id: None,
+                            items: diagnostics,
+                        },
+                    },
+                ),
+            )),
+            Err(err) => {
+                self.client
+                    .log_message(MessageType::ERROR, format!("Failed diagnostics: {err}"))
+                    .await;
+                Err(jsonrpc::Error {
+                    code: jsonrpc::ErrorCode::InternalError,
+                    message: "Failed to collect diagnostics".into(),
+                    data: None,
+                })
+            }
+        }
+    }
+
     async fn shutdown(&self) -> jsonrpc::Result<()> {
         self.client.log_message(MessageType::INFO, "Shutdown").await;
         Ok(())
@@ -180,7 +218,7 @@ impl CratesIoBackend {
         }
     }
 
-    async fn collect_diagnostics(&self, text: &str) -> Result<Vec<lsp_types::Diagnostic>> {
+    async fn collect_diagnostics(&self, text: &str) -> Result<Vec<ls_types::Diagnostic>> {
         let parsed: SpannedManifest = toml::from_str(text)?;
         let deps = parsed
             .dependencies
@@ -208,7 +246,7 @@ impl CratesIoBackend {
                 offset_to_pos(text, name.span().start),
                 offset_to_pos(text, name.span().end),
             ) {
-                lsp_types::Range { start, end }
+                ls_types::Range { start, end }
             } else {
                 continue; // Outside the document?
             };
@@ -250,7 +288,7 @@ impl CratesIoBackend {
                 )
             };
 
-            diagnostics.push(lsp_types::Diagnostic {
+            diagnostics.push(ls_types::Diagnostic {
                 range,
                 severity: Some(severity),
                 source: Some("crates-io".into()),
@@ -322,9 +360,8 @@ async fn main() {
 
 fn is_cargo_toml(uri: &Uri) -> bool {
     uri.path()
-        .segments()
-        .next_back()
-        .is_some_and(|n| n == "Cargo.toml")
+        .segments_if_absolute()
+        .is_some_and(|segments| segments.last().is_some_and(|n| n == "Cargo.toml"))
 }
 
 fn pos_to_offset(text: &str, pos: Position) -> Option<usize> {
