@@ -12,7 +12,7 @@ use tower_lsp_server::ls_types::{
     MessageType, Position, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
     Uri,
 };
-use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
+use tower_lsp_server::{Client, LanguageServer, LspService, Server, jsonrpc};
 
 mod api;
 
@@ -42,6 +42,7 @@ impl LanguageServer for CratesIoBackend {
             .await;
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
+                position_encoding: Some(ls_types::PositionEncodingKind::UTF8),
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
@@ -94,17 +95,23 @@ impl LanguageServer for CratesIoBackend {
         }
 
         let mut open_docs = self.open_docs.write().await;
-        let doc = open_docs.get_mut(&params.text_document.uri).unwrap();
-        for change in params.content_changes {
-            if let Some(range) = change.range {
-                let start = pos_to_offset(&doc.text, range.start).unwrap();
-                let end = pos_to_offset(&doc.text, range.end).unwrap();
-                doc.text.replace_range(start..end, &change.text);
-            } else {
-                doc.text = change.text;
+        if let Some(doc) = open_docs.get_mut(&params.text_document.uri) {
+            for change in params.content_changes {
+                if let Some(range) = change.range {
+                    if let (Some(start), Some(end)) = (
+                        pos_to_offset(&doc.text, range.start),
+                        pos_to_offset(&doc.text, range.end),
+                    ) {
+                        if start <= end && end <= doc.text.len() {
+                            doc.text.replace_range(start..end, &change.text);
+                        }
+                    }
+                } else {
+                    doc.text = change.text;
+                }
             }
+            doc.version = params.text_document.version;
         }
-        doc.version = params.text_document.version;
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -118,17 +125,20 @@ impl LanguageServer for CratesIoBackend {
             return;
         }
 
-        let mut open_docs = self.open_docs.write().await;
-        let doc = open_docs.get_mut(&params.text_document.uri);
-        let (text, version) = if let (Some(doc), Some(text)) = (doc, &params.text) {
-            doc.text = text.clone();
-            (&doc.text, Some(doc.version))
-        } else if let Some(text) = &params.text {
-            (text, None)
-        } else {
-            return;
+        let (text, version) = {
+            let mut open_docs = self.open_docs.write().await;
+            if let Some(doc) = open_docs.get_mut(&params.text_document.uri) {
+                if let Some(text) = &params.text {
+                    doc.text = text.clone();
+                }
+                (doc.text.clone(), Some(doc.version))
+            } else if let Some(text) = &params.text {
+                (text.clone(), None)
+            } else {
+                return;
+            }
         };
-        self.update_diagnostics(&params.text_document.uri, version, text)
+        self.update_diagnostics(&params.text_document.uri, version, &text)
             .await;
     }
 
@@ -366,9 +376,8 @@ fn is_cargo_toml(uri: &Uri) -> bool {
 
 fn pos_to_offset(text: &str, pos: Position) -> Option<usize> {
     let line = text.lines().nth(pos.line as _)?;
-    let line_start = unsafe { line.as_ptr().offset_from(text.as_ptr()) };
-    assert!(line_start >= 0);
-    Some(line_start as usize + pos.character as usize)
+    let line_start = text.as_bytes().element_offset(line.as_bytes().first()?)?;
+    Some(line_start + pos.character as usize)
 }
 
 fn offset_to_pos(text: &str, offset: usize) -> Option<Position> {
